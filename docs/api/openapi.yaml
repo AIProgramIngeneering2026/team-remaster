@@ -1,0 +1,416 @@
+openapi: 3.0.3
+info:
+  title: Remaster — конвейер обработки документов
+  version: 0.1.0
+  description: |
+    Сервис принимает документы (PDF, DOCX, TXT, до 20 МБ) и задания на их обработку.
+    Задание выполняется в фоне (ADR-0001): `POST /jobs` сразу возвращает задание,
+    результат — через `GET /jobs/{id}`.
+
+    Все ошибки — в едином формате `Error`: `{code, message, details}`.
+    Авторизации нет — сервис рассчитан на доверенную среду (ADR-0002).
+
+    Жизненный цикл задания и запрещённые переходы — `docs/architecture.md`.
+
+servers:
+  - url: http://localhost:8000
+
+tags:
+  - name: documents
+  - name: jobs
+
+paths:
+  /documents:
+    post:
+      tags: [documents]
+      operationId: uploadDocument
+      summary: Загрузить документ
+      description: |
+        Сохраняет файл и возвращает его идентификатор. Формат на этом шаге не проверяется:
+        неподдерживаемый или повреждённый документ отклоняется при проверке задания
+        (задание переходит в `rejected`). Размер проверяется сразу.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Документ сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Document"
+        "400":
+          description: "Нет поля `file` — `invalid_params`, `details.field = \"file\"`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: invalid_params
+                message: file is required
+                details:
+                  field: file
+        "413":
+          description: Файл больше 20 МБ — `file_too_large`, документ не сохраняется
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: file_too_large
+                message: file exceeds 20 MB
+                details:
+                  max_bytes: 20971520
+
+  /jobs:
+    post:
+      tags: [jobs]
+      operationId: createJob
+      summary: Создать задание на обработку
+      description: |
+        Создаёт задание в состоянии `uploaded` и сразу отвечает. Выполнение — в фоне.
+
+        **Идемпотентность.** Заголовок `Idempotency-Key` обязателен. Ключ хранится 24 часа.
+        - Новый ключ → `201`, создано новое задание.
+        - Тот же ключ и то же тело → `200`, прежнее задание в его текущем состоянии, новое не создаётся.
+          Одновременные запросы с одним ключом создают ровно одно задание.
+        - Тот же ключ, другое тело → `409 idempotency_conflict`, задание не создаётся.
+
+        **Проверка запроса** выполняется до создания задания: неизвестная операция,
+        неверные параметры и несуществующий документ отклоняются, задание не создаётся,
+        ключ не запоминается. Параметры проверяет процессор операции (`docs/tool-contract.md`).
+
+        Максимальный размер тела запроса — 64 КБ.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+            examples:
+              extract_text:
+                value:
+                  operation: extract_text
+                  document_id: 3f6c2b1e-9a4d-4c1e-8f0a-2d5b7e9c1a44
+              translate:
+                value:
+                  operation: translate
+                  document_id: 3f6c2b1e-9a4d-4c1e-8f0a-2d5b7e9c1a44
+                  params:
+                    target_lang: en
+      responses:
+        "201":
+          description: Задание создано
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "200":
+          description: Повтор с тем же `Idempotency-Key` и тем же телом — прежнее задание
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: |
+            - `missing_idempotency_key` — нет заголовка или он длиннее 64 символов;
+            - `unknown_operation` — операции нет среди `extract_text`, `stats`, `convert`, `translate`;
+            - `invalid_params` — нет поля, неверный тип или недопустимое значение; имя поля — в `details.field`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                unknown_operation:
+                  value:
+                    code: unknown_operation
+                    message: "operation 'dance' is not supported"
+                    details:
+                      field: operation
+                      allowed: [extract_text, stats, convert, translate]
+                invalid_params:
+                  value:
+                    code: invalid_params
+                    message: target_lang must be a two-letter language code
+                    details:
+                      field: params.target_lang
+        "404":
+          description: Документа с таким `document_id` нет — `document_not_found`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Тот же `Idempotency-Key`, но другое тело — `idempotency_conflict`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: idempotency_conflict
+                message: Idempotency-Key was used with a different request body
+                details:
+                  field: Idempotency-Key
+                  job_id: 7d1e4a90-1b2c-4d3e-9f80-6a5b4c3d2e1f
+        "413":
+          description: Тело запроса больше 64 КБ — `payload_too_large`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: Состояние и результат задания
+      description: |
+        `result` заполнен только в `processed`, `error` — только в `rejected` и `failed`.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Задание
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: Задания нет — `job_not_found`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /jobs/{id}/result:
+    get:
+      tags: [jobs]
+      operationId: getJobResultFile
+      summary: Файл результата (для операции convert)
+      description: |
+        Возвращает сконвертированный файл. Для остальных операций результат — в поле `result` задания.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Файл результата
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+        "404":
+          description: Задания нет — `job_not_found`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: |
+            `result_not_ready` — задание не в `processed` (ещё выполняется, отклонено, упало или отменено)
+            либо его операция не `convert`; текущее состояние — в `details.status`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      operationId: cancelJob
+      summary: Отменить задание
+      description: |
+        Отмена возможна только до начала выполнения — из `uploaded` и `queued`.
+        Повторная отмена уже отменённого задания безопасна: `200`, состояние не меняется.
+        Если отмена и взятие в работу пришли одновременно, выполняется первый переход.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Задание в состоянии `cancelled`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: Задания нет — `job_not_found`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: |
+            `invalid_transition` — задание уже выполняется или завершено
+            (`processing`, `processed`, `rejected`, `failed`); текущее состояние — в `details.status`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: invalid_transition
+                message: cannot cancel job in state processing
+                details:
+                  status: processing
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Строка до 64 символов, которую генерирует клиент. Хранится 24 часа.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Error:
+      type: object
+      description: Единый формат всех ошибок API
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Машиночитаемый код ошибки
+          enum:
+            - invalid_params
+            - missing_idempotency_key
+            - unknown_operation
+            - document_not_found
+            - job_not_found
+            - idempotency_conflict
+            - invalid_transition
+            - result_not_ready
+            - file_too_large
+            - payload_too_large
+            - internal_error
+        message:
+          type: string
+          description: Описание для человека
+        details:
+          type: object
+          description: Подробности — например, `field` с именем неверного поля или `status` с текущим состоянием
+          additionalProperties: true
+
+    Document:
+      type: object
+      required: [document_id, filename, size_bytes, created_at]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        size_bytes:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    CreateJobRequest:
+      type: object
+      required: [operation, document_id]
+      additionalProperties: false
+      properties:
+        operation:
+          type: string
+          description: Имя операции. Список — в `ProcessorRegistry`; неизвестное имя → `unknown_operation`
+          example: extract_text
+        document_id:
+          type: string
+          format: uuid
+        params:
+          type: object
+          description: |
+            Параметры операции, проверяет процессор:
+            - `extract_text`, `stats` — без параметров;
+            - `convert` — `target_format`: `pdf` или `txt`; пары DOCX → PDF, TXT → PDF, PDF → TXT, DOCX → TXT,
+              для остальных задание завершится в `failed` с `unsupported_conversion`;
+            - `translate` — `target_lang` (обязательно), `source_lang` (необязательно; если передан —
+              проверяется так же), двухбуквенные коды языков.
+          additionalProperties: true
+          default: {}
+
+    JobStatus:
+      type: string
+      enum: [uploaded, queued, processing, processed, rejected, failed, cancelled]
+
+    JobError:
+      type: object
+      description: Причина, по которой задание оказалось в `rejected` или `failed`
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - unsupported_format
+            - corrupted_file
+            - parse_error
+            - text_too_long
+            - unsupported_conversion
+            - translation_unavailable
+            - translation_rejected
+            - translation_bad_response
+            - interrupted
+            - internal_error
+        message:
+          type: string
+
+    Job:
+      type: object
+      required: [id, document_id, operation, params, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        operation:
+          type: string
+        params:
+          type: object
+          additionalProperties: true
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        result:
+          type: object
+          nullable: true
+          description: |
+            Только в `processed`. Зависит от операции:
+            - `extract_text` — `{text}`;
+            - `stats` — `{words, chars, paragraphs, top_words}`;
+            - `translate` — `{text, source_lang, target_lang}`;
+            - `convert` — `{format, size_bytes}`, сам файл — `GET /jobs/{id}/result`.
+          additionalProperties: true
+        error:
+          allOf:
+            - $ref: "#/components/schemas/JobError"
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
