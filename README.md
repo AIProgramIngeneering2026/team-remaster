@@ -44,3 +44,22 @@ Python 3.14, FastAPI, SQLAlchemy + Alembic, SQLite -> PostgreSQL, pytest, Docker
 
 - [Требования и сценарии](docs/requirements.md)
 - [Как мы работаем](CONTRIBUTING.md)
+
+## Локальная разработка
+
+Требуется Python 3.14. Установите проект и зависимости для разработки:
+
+```bash
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+Запуск тестов:
+
+```bash
+python -m pytest
+```
+
+CI выполняет эту же команду для каждого pull request. Переменные локальной среды перечислены в `.env.example`; файл `.env` с локальными значениями не попадает в Git.
